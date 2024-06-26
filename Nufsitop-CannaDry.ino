@@ -1,308 +1,151 @@
+/* * * * * TFT Display  * * * * */
 #include <Adafruit_GFX.h>    // Core graphics library
 #include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
 #include <SPI.h>
-#include "hempb.h"
 
-// Pinbelegungen von https://github.com/Xinyuan-LilyGO/TTGO-T-Display
-#define TFT_MOSI 19
+#define TFT_MOSI 19          // Pinbelegungen von https://github.com/Xinyuan-LilyGO/TTGO-T-Display
 #define TFT_SCLK 18
 #define TFT_CS 5
 #define TFT_DC 16
 #define TFT_RST 23
 #define TFT_BL 4
 
-// Konstruktor für das Datenobjekt tft
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
-
-#include "hemp.h"
-#include <BME280I2C.h>
-#include <Wire.h>
 
 /* * * * * WIFI  * * * * */
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
 WiFiMulti wifiMulti;
-
 String ssid = "";
 char* password = "";
-int onoff = 0;
 
 /* * * * * SHELLY  * * * * */
 String shelly_sn = "", shelly_id;
 int shelly_RSSI;
-int shelly_on = 0;
-unsigned int shellys = 0, trigger_radon, trigger_iaq;
+int shelly_on = 3;
+unsigned int shellyFound = 0, trigger_radon, trigger_iaq;
 unsigned int shelly_pow, shelly_meter, shelly_return;
 
+/* * * * * BME280 * * * * */
+#include <BME280I2C.h>
+#include <Wire.h>
 BME280I2C bme;         // Default : forced mode, standby time = 1000 ms
 float BMEtemp, BMEhum; // Oversampling = pressure ×1, temperature ×1, humidity ×1, filter off,
+int tempLow = 15, tempHigh = 18;
 
 // macadr -> sn
 unsigned long mac_adr;
 String sn = "";
 
+unsigned long previousMillisBME280 = 0;  // Variable zum Speichern des letzten Zeitpunkts für printBME280
+unsigned long previousMillisWifi = 0;    // Variable zum Speichern des letzten Zeitpunkts für sendDataWifi
+unsigned long currentMillis = millis();  // Variable zum Speichern des aktuellen Zeitpunkts
+const long intervalBME280 = 60000;       // Intervall von einer Minute (60000 Millisekunden)
+const long intervalWifi = 770000;        // Intervall von 13 Minuten (780000 Millisekunden)
+
+int greenhemp = 180;
+int colorhemp = 100;
+int displayTime = 2000;
+
+#include "hempb.h"
+#include "hemp.h"
+
 void setup(void) {
   delay(3000);
+  pinMode(TFT_BL, OUTPUT);      // TTGO T-Display Backlight Pin 4 aktivieren
+  delay(1000);  
   Serial.begin(115200);
   delay(1000);
-  pinMode(TFT_BL, OUTPUT);      // TTGO T-Display Backlight Pin 4 aktivieren
-
   Serial.println(F("Nufsitop V0.2"));
-
   delay(1000);
-
   sn = generateMacSerial();
   Serial.println("Flash:" + showDateGerman() + "SN: " + sn);
-
   delay(1000);
 
-  initBME280();
-  printBME280();
-
-  delay(1000);
-
-  wifi_scan();
-
-  delay(1000);
-
-  digitalWrite(TFT_BL, HIGH);   // T-Display Backlight einschalten
-  tft.init(135, 240);           // ST7789 initialisieren 240x135
-  tft.setRotation(3);           // Optional: Display-Rotation einstellen
+  tftInit();
   Serial.println(F("showLogo"));
   showLogo();
 
-  wifiMulti.addAP("Studio2", "Wolf1212");
-}
+  initBME280(); 
+  getBME280();
+  tft4Lines("NUF SI TOP", "Temp.:   " + String(BMEtemp,0) + "C", "Feuchte: " + String(BMEhum,0) + "%", "-> Steckdose?", 2000);
 
-void loop() {
-  printBME280();
-  sendDataWifi();
-  delay(300000);
+  wifi_scan(); 
 
-//   if (shelly_on == 0) {   
-//     shelly_wifi(1);
-//   } else {
-//     shelly_wifi(0);
-//   }
-}
-
-String showDateGerman() {
-  const char* months[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  const char* monthNumbers[12] = {"01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"};
-  String originalDate = __DATE__;
-  String monthString = originalDate.substring(0, 3);
-  String day = originalDate.substring(4, 6);
-  String year = originalDate.substring(9, 11);
-  String month = "00";
-  for (int i = 0; i < 12; i++) {
-    if (monthString == months[i]) {
-      month = monthNumbers[i];
-      break;
-    }
+  shelly_on = shelly_wifi(0);
+  if (shelly_on == 0) {
+    tft4Lines("NUF SI TOP", " ", "Verbindung", "Steckdose OK", 2000);
+  } else {
+    tft4Lines("NUF SI TOP", "Verbindung", "Steckdose", "gescheitert!", 2000);
   }
-  return day + "." + month + "." + year;
+
+  showLosGehts();
+  backlightOff();
 }
 
-String convertToArbitraryBase(unsigned long value, int base) {
-  static char baseChars[] = "ZWAFBCDEFGHIJKLMNZPFRSTUV71234WXYZABCDEF7123456789GHIJKLM6789NZPHRSTUVWXYZPB";
-  String result = "";
-  do {
-    result = String(baseChars[value % base]) + result; // Add on the left
-    value /= base;
-  } while (value != 0);
-  return result; 
-} // Spezielle convertToArbitraryBase Funktion
-
-String generateMacSerial() {
-  WiFi.begin();  // Start WiFi to get MAC address
-  String macStr = WiFi.macAddress();  // Buffer for the MAC address
-  uint8_t baseMac[6];  // Parse MAC address
-  sscanf(macStr.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
-         &baseMac[0], &baseMac[1], &baseMac[2], &baseMac[3], &baseMac[4], &baseMac[5]);
-  unsigned long mac_adr = (baseMac[2]) + (baseMac[3] * 213) + (baseMac[4] * 231 * 253) + (baseMac[5] * 237 * 219 * 251);
-  mac_adr = mac_adr + 1321754191; // Calculate mac_adr
-  String sn = convertToArbitraryBase(mac_adr, 68); // Convert to arbitrary base
-  if (sn.length() > 5) { // Ensure sn is not longer than 5 characters
-    sn = sn.substring(0, 5);
+void loop() { currentMillis = millis();
+// ALLE 13 MINUTEN
+  if (currentMillis - previousMillisWifi >= intervalWifi) {     // Überprüft, ob 13 Minuten vergangen sind
+    previousMillisWifi = currentMillis;                         // Speichert den aktuellen Zeitpunkt
+    wifiMulti.addAP("Studio2", "Wolf1212");
+    //wifiMulti.addAP("ALARM4U", "Wolf1212");
+    delay(100);
+    sendDataWifi();
+    delay(100);
+    WiFi.disconnect();  
+    tftInit();
+    tft4Lines("NUF SI TOP", "Datentransfer", "Temp.:   " + String(BMEtemp,0) + "C", "Feuchte: " + String(BMEhum,0) + "%", 5000);
+    backlightOff();          
   }
-  return sn;
-}
 
-
-int sendDataWifi() {
-  if ((wifiMulti.run() == WL_CONNECTED)) {
-    HTTPClient http;
-    Serial.print("[HTTP] begin...\n");
-    //                            Sensor;GSMTRY;BQM;STATUS;TMP;HUM;HPA;IAQ;STA_IAQ;POW_1;METER;$EPOCH
-
-    http.begin("http://con.radocon.de/r.php?a="+sn+";1;0;1;"+String(BMEtemp*10, 0)+";"+String(BMEhum*10, 0)+";990;0;0;0;0;1");  //HTTP
-    Serial.print("[HTTP] GET...\n");
-    int httpCode = http.GET();
-    if (httpCode > 0) {
-      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
-      if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        Serial.println(payload);
-      }
+// JEDE MINUTE
+  if (currentMillis - previousMillisBME280 >= intervalBME280) { // Überprüft, ob eine Minute vergangen ist
+    previousMillisBME280 = currentMillis;                       // Speichert den aktuellen Zeitpunkt
+    printBME280();
+    tftInit();
+    if (BMEtemp > tempHigh && shelly_on == 0) {
+      shelly_wifi(1);
+      Serial.println(String(BMEtemp,1) + ">" + String(tempHigh) + " - Shelly AN");
+      tft4Lines("NUF SI TOP", "Temp.:   " + String(BMEtemp,0) + "C", "Feuchte: " + String(BMEhum,0) + "%", "Steckdose AN", 5000);
+    } else if (BMEtemp < tempLow && shelly_on == 1) {
+      shelly_wifi(0);
+      Serial.println(String(BMEtemp,1) + "<" + String(tempLow) + " - Shelly Aus");
+      tft4Lines("NUF SI TOP", "Temp.:   " + String(BMEtemp,0) + "C", "Feuchte: " + String(BMEhum,0) + "%", "Steckdose AUS", 5000);
     } else {
+      tft4Lines("NUF SI TOP", "Temp.:   " + String(BMEtemp,0) + "C", "Feuchte: " + String(BMEhum,0) + "%", "Steckdose: " + String(shelly_on), 5000);
+    }
+    backlightOff();
+  }
+}
+
+
+
+void sendDataWifi() {                           
+  if ((wifiMulti.run() == WL_CONNECTED)) {      // Überprüft, ob das Gerät mit einem WiFi-Netzwerk verbunden ist
+    HTTPClient http;                            // Erstellt ein HTTPClient-Objekt
+    Serial.print("[HTTP] begin...\n");
+    // URL für die HTTP-Anfrage            Sensor;GSMTRY;BQM;STATUS;TMP;HUM;HPA;IAQ;STA_IAQ;POW_1;METER;$EPOCH
+    http.begin("http://con.radocon.de/r.php?a="+sn+";1;0;1;"+String(BMEtemp*10, 0)+";"+String(BMEhum*10, 0)+";990;0;0;0;0;1");  // HTTP
+    Serial.print("[HTTP] GET...\n");
+    int httpCode = http.GET();                  // Führt die HTTP GET-Anfrage aus
+
+    if (httpCode > 0) {                         // Überprüft, ob die Anfrage erfolgreich war
+      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+
+      if (httpCode == HTTP_CODE_OK) {           // Überprüft, ob der HTTP-Statuscode OK (200) ist
+        String payload = http.getString();      // Ruft die Antwort als String ab
+        Serial.println(payload);                // Gibt die Antwort auf dem Serial-Monitor aus
+      }
+    } else {                                    // Gibt eine Fehlermeldung aus, falls Fehlgeschlag
       Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
     }
-    http.end();
+    http.end();                                 // Beendet die HTTP-Verbindung
   }
-  return 0; // Füge einen Rückgabewert hinzu, um sicherzustellen, dass die Funktion korrekt endet
-}
-
-int shelly_wifi(int shelly_task) {
-    long timeout = millis();                // Speichert den aktuellen Zeitpunkt in Millisekunden
-    unsigned int shelly_return = 9999;      // Initialwert für den Rückgabewert
-    ssid = "ShellyPlusPlugS-" + shelly_sn;  // Setzt die SSID für das Shelly-Gerät
-    
-    WiFi.mode(WIFI_STA);                    // Setzt den WiFi-Modus auf Station
-    WiFi.begin(ssid.c_str(), password);     // Verbindet mit dem WiFi-Netzwerk
-    
-    while (WiFi.status() != WL_CONNECTED) { // Wartet, bis die WiFi-Verbindung hergestellt ist
-      if ((millis() - timeout) > 15000) {   // Bricht nach 15 Sekunden ab
-        break;
-      }
-    }
-
-    shelly_id = "1 ID:" + WiFi.SSID() + "S:" + (WiFi.RSSI() * -1); // Setzt die shelly_id mit SSID und Signalstärke
-    delay(100);                             // Wartet 100 Millisekunden
-    const uint16_t port = 80;               // Setzt den Zielport
-    const char * host = "192.168.33.1";     // Setzt die Ziel-IP-Adresse
-    WiFiClient client;                      // Erstellt einen WiFiClient
-
-    if (!client.connect(host, port)) {      // Verbindet zum Host, falls nicht erfolgreich
-        shelly_return = 8888;               // Setzt den Rückgabewert auf 8888
-        return shelly_return;               // Gibt den Rückgabewert zurück
-    }
-
-    switch (shelly_task) {                  // Führt eine Aufgabe basierend auf shelly_task aus
-      case 0:
-        client.print("GET /relay/0?turn=off HTTP/1.1\n\n");   // Schaltet das Relais aus
-        shelly_return = 0;
-        shelly_on = 0;
-        break;
-      case 1:
-        client.print("GET /relay/0?turn=on HTTP/1.1\n\n");    // Schaltet das Relais ein
-        shelly_return = 1;
-        shelly_on = 1;
-        break;
-      default:
-        client.print("GET /meter/0 HTTP/1.1\n\n");            // Liest den Zählerwert
-        shelly_return = 0;
-    }
-
-    int maxloops = 0;                        // Initialisiert eine Schleifenvariable
-    while (!client.available() && maxloops < 1000) {          // Wartet, bis Daten verfügbar sind
-        maxloops++;
-        delay(1);                            // Wartet 1 Millisekunde
-    }
-
-    String watt;  
-    if (client.available() > 0) {             // Wenn Daten verfügbar sind
-        String line = client.readStringUntil('{'); // Liest bis zum ersten '{'
-        line = client.readStringUntil(':');   // Liest bis zum ersten ':'
-        line = client.readStringUntil(',');   // Liest bis zum ersten ','
-        shelly_id = line + " " + shelly_id;   // Aktualisiert die shelly_id
-        watt = line;                          // Setzt watt auf den gelesenen Wert
-    } else {
-        Serial.println("client.available() timed out "); // Meldet Timeout
-    }
-
-    client.stop();                            // Beendet die Verbindung zum Server
-    WiFi.disconnect();                        // Trennt die WiFi-Verbindung
-    shelly_id = shelly_id + " T:" + (millis() - timeout) + "ms"; // Aktualisiert shelly_id mit der verstrichenen Zeit
-
-    if (shelly_task > 1) {
-        shelly_return = watt.toInt();         // Setzt den Rückgabewert auf den gelesenen watt-Wert
-    } 
-
-    return shelly_return;                     // Gibt den Rückgabewert zurück
 }
 
 
-void wifi_scan()
-{
-    WiFi.mode(WIFI_STA);
-    disconnectWifi();
-    int routerRSSI;
-    String router, shelly;
-    int16_t n = WiFi.scanNetworks();
-    shellys = 0;
-    if (n == 0) {
-      Serial.println("> keine Netzwerke");
-    } else {
-         Serial.printf("gefunden %d net\n", n);
-        for (int i = 0; i < n; ++i) {
-            router = WiFi.SSID(i).c_str();  
-            routerRSSI = 101 + WiFi.RSSI(i);     
-            //Serial.println(router + " " + String(routerRSSI));          
-            if (router.length() == 28){
-              if (router.substring(0,16) == "ShellyPlusPlugS-"){
-                Serial.print("> Shelly SN: ");
-                shelly_RSSI = routerRSSI;                  
-                shelly_sn = router.substring(16,28);;
-                Serial.println(shelly_sn + " - RSSI: " + String(shelly_RSSI));         
-                shellys = 1;       
-              }
-            }
-        }
-    }
-    disconnectWifi();
-    WiFi.mode(WIFI_OFF);
-    delay(100);
-}
 
-void disconnectWifi() {
-    if (WiFi.status() == WL_CONNECTED) {    
-        WiFi.disconnect(true);
-        delay(100);
-    }
- }
 
-void initBME280() {
-  Wire.begin();
-  while(!bme.begin())
-  {
-    Serial.println("Could not find BME280 sensor!");
-    delay(1000);
-  }
-  switch(bme.chipModel())
-  {
-     case BME280::ChipModel_BME280:
-       Serial.println("Found BME280 sensor! Success.");
-       break;
-     case BME280::ChipModel_BMP280:
-       Serial.println("Found BMP280 sensor! No Humidity available.");
-       break;
-     default:
-       Serial.println("Found UNKNOWN sensor! Error!");
-  }
-  delay(100);
-  BME280Data();
-  delay(100);  
-  BME280Data();
-  delay(100);  
-}
-
-void printBME280()
-{
-  BME280Data();
-  delay(100);  
-  BME280Data();
-  Serial.println("Tmp: " + String(BMEtemp,0) + "C -  Hum:" + String(BMEhum,0) + "%");
-}
-
-void BME280Data()
-{
-  float temp(NAN), hum(NAN), pres(NAN);
-  BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
-  BME280::PresUnit presUnit(BME280::PresUnit_Pa);
-  bme.read(pres, temp, hum, tempUnit, presUnit);
-  BMEtemp = temp;
-  BMEhum = hum;
-}
 
 
